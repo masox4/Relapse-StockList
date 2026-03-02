@@ -1,0 +1,228 @@
+Option Explicit
+
+'========================
+' Helpers
+'========================
+Private Function NormalizeText(ByVal s As String) As String
+    s = Replace(s, Chr(160), " ") ' NBSP -> space
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeText = UCase$(s)
+End Function
+
+Private Function GetSheetLoose(ByVal wb As Workbook, ByVal sheetName As String) As Worksheet
+    Dim sh As Object
+    Dim target As String: target = NormalizeText(sheetName)
+
+    For Each sh In wb.Sheets
+        If NormalizeText(sh.Name) = target Then
+            Set GetSheetLoose = sh
+            Exit Function
+        End If
+    Next sh
+End Function
+
+Private Function ExtractBeforeSpaceApostrophe(ByVal fullName As String) As String
+    ' Return text before " '" (space + apostrophe). If not found, return whole string.
+    Dim p As Long
+    fullName = Trim$(fullName)
+    p = InStr(1, fullName, " '", vbBinaryCompare)
+    If p > 0 Then
+        ExtractBeforeSpaceApostrophe = Trim$(Left$(fullName, p - 1))
+    Else
+        ExtractBeforeSpaceApostrophe = fullName
+    End If
+End Function
+
+'========================
+' Main macro (does BOTH tasks)
+'========================
+Public Sub Run_CopyHere_ParentRows_And_CategoryCheck()
+    '---- Column setup (adjust if needed)
+    Const COL_SKU_A As Long = 1   'Copy Here: A
+    Const COL_SKU_E As Long = 5   'Copy Here: E
+    Const COL_SIZE  As Long = 8   'Copy Here: H
+    Const COL_OUT_M As Long = 13  'Copy Here: M
+    Const HEADER_ROW As Long = 1
+
+    Const CAT_COL_G As Long = 7   'CatMap: G
+    Const CAT_COL_J As Long = 10  'CatMap: J
+
+    Const BRAND_COL_SKU As Long = 1 'Brand: A
+    Const BRAND_COL_NAME As Long = 2 'Brand: B
+
+    Dim wb As Workbook
+    Dim wsCopy As Worksheet, wsCat As Worksheet, wsBrand As Worksheet
+    Dim lastRow As Long, r As Long
+
+    Dim dictSkuToTerm As Object      'SKU -> extracted term
+    Dim dictCatTerms As Object       'term -> True
+
+    Dim sku As String, baseSku As String, sizeVal As String
+    Dim nm As String, term As String
+    Dim v As String
+
+    Set wb = ActiveWorkbook
+
+    Set wsCopy = GetSheetLoose(wb, "Copy Here")
+    Set wsCat = GetSheetLoose(wb, "CatMap")
+    Set wsBrand = GetSheetLoose(wb, "Brand")
+
+    If wsCopy Is Nothing Or wsCat Is Nothing Or wsBrand Is Nothing Then
+        MsgBox "Missing one or more sheets: Copy Here / CatMap / Brand. Check sheet names.", vbExclamation
+        Exit Sub
+    End If
+
+    On Error GoTo CleanFail
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    '========================
+    ' 1) Insert parent rows (above Small rows)
+    '========================
+    lastRow = wsCopy.Cells(wsCopy.Rows.Count, COL_SKU_A).End(xlUp).Row
+
+    For r = lastRow To HEADER_ROW + 1 Step -1
+        sku = Trim$(CStr(wsCopy.Cells(r, COL_SKU_A).Value))
+        If Len(sku) > 1 And UCase$(Right$(sku, 1)) = "S" Then
+            sizeVal = UCase$(Trim$(CStr(wsCopy.Cells(r, COL_SIZE).Value)))
+            If sizeVal = "S" Then
+                baseSku = Left$(sku, Len(sku) - 1)
+
+                'Skip if the row above is already the parent row
+                If Trim$(CStr(wsCopy.Cells(r - 1, COL_SKU_A).Value)) <> baseSku _
+                   Or Trim$(CStr(wsCopy.Cells(r - 1, COL_SKU_E).Value)) <> baseSku Then
+
+                    wsCopy.Rows(r).Insert Shift:=xlShiftDown
+                    wsCopy.Cells(r, COL_SKU_A).Value = baseSku
+                    wsCopy.Cells(r, COL_SKU_E).Value = baseSku
+                End If
+            End If
+        End If
+    Next r
+
+    '========================
+    ' 2) Build lookup: Brand SKU -> extracted term
+    '========================
+    Set dictSkuToTerm = CreateObject("Scripting.Dictionary")
+    dictSkuToTerm.CompareMode = vbTextCompare
+
+    lastRow = wsBrand.Cells(wsBrand.Rows.Count, BRAND_COL_SKU).End(xlUp).Row
+    For r = 2 To lastRow
+        sku = Trim$(CStr(wsBrand.Cells(r, BRAND_COL_SKU).Value))
+        nm = CStr(wsBrand.Cells(r, BRAND_COL_NAME).Value)
+        If Len(sku) > 0 Then
+            term = ExtractBeforeSpaceApostrophe(nm)
+            If Len(term) > 0 Then dictSkuToTerm(sku) = term
+        End If
+    Next r
+
+    '========================
+    ' 3) Build lookup: CatMap terms (from G and J)
+    '========================
+    Set dictCatTerms = CreateObject("Scripting.Dictionary")
+    dictCatTerms.CompareMode = vbTextCompare
+
+    Dim lastG As Long, lastJ As Long, lastCat As Long
+    lastG = wsCat.Cells(wsCat.Rows.Count, CAT_COL_G).End(xlUp).Row
+    lastJ = wsCat.Cells(wsCat.Rows.Count, CAT_COL_J).End(xlUp).Row
+    lastCat = IIf(lastG > lastJ, lastG, lastJ)
+
+    For r = 2 To lastCat
+        v = Trim$(CStr(wsCat.Cells(r, CAT_COL_G).Value))
+        If Len(v) > 0 Then dictCatTerms(v) = True
+
+        v = Trim$(CStr(wsCat.Cells(r, CAT_COL_J).Value))
+        If Len(v) > 0 Then dictCatTerms(v) = True
+    Next r
+
+    '========================
+    ' 4) Write results to Copy Here column M
+    '========================
+    lastRow = wsCopy.Cells(wsCopy.Rows.Count, COL_SKU_A).End(xlUp).Row
+
+    For r = 2 To lastRow
+        sku = Trim$(CStr(wsCopy.Cells(r, COL_SKU_A).Value))
+        If Len(sku) = 0 Then
+            wsCopy.Cells(r, COL_OUT_M).Value = vbNullString
+        Else
+            If dictSkuToTerm.Exists(sku) Then
+                term = dictSkuToTerm(sku)
+
+                If dictCatTerms.Exists(term) Then
+                    wsCopy.Cells(r, COL_OUT_M).Value = "OK"
+                Else
+                    wsCopy.Cells(r, COL_OUT_M).Value = "NO MATCH - CHECK CATEGORIES"
+                End If
+            Else
+                wsCopy.Cells(r, COL_OUT_M).Value = "NO MATCH - CHECK CATEGORIES"
+            End If
+        End If
+    Next r
+
+CleanExit:
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+CleanFail:
+    'Always restore Excel settings
+    Resume CleanExit
+End Sub
+
+'========================
+' Button creator (run once)
+'========================
+Public Sub Create_CopyHere_RunButton()
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    Dim rng As Range
+    Dim shp As Shape
+    Dim nm As String: nm = "btnRunParentCat"
+
+    Set wb = ActiveWorkbook
+    Set ws = GetSheetLoose(wb, "Copy Here")
+    If ws Is Nothing Then
+        MsgBox "Can't find sheet 'Copy Here'.", vbExclamation
+        Exit Sub
+    End If
+
+    Set rng = ws.Range("N1")
+
+    'Delete existing button if present
+    On Error Resume Next
+    ws.Shapes(nm).Delete
+    On Error GoTo 0
+
+    'Create a small shape and auto-fit to text
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, rng.Left + 2, rng.Top + 2, 10, 10)
+    shp.Name = nm
+    shp.OnAction = "Run_CopyHere_ParentRows_And_CategoryCheck"
+
+    With shp
+        .TextFrame2.TextRange.Text = "Run"
+        .TextFrame2.AutoSize = msoAutoSizeShapeToFitText
+        .TextFrame2.MarginLeft = 6
+        .TextFrame2.MarginRight = 6
+        .TextFrame2.MarginTop = 3
+        .TextFrame2.MarginBottom = 3
+
+        .Fill.ForeColor.RGB = RGB(0, 51, 102) 'dark blue
+        .Line.Visible = msoFalse
+
+        With .TextFrame2.TextRange.Font
+            .Fill.ForeColor.RGB = RGB(255, 255, 255) 'white
+            .Bold = msoTrue
+            .Size = 10
+        End With
+
+        .Placement = xlMoveAndSize
+    End With
+End Sub
+
+
+
