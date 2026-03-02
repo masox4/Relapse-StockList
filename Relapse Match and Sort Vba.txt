@@ -198,18 +198,22 @@ Public Sub Create_CopyHere_RunButton()
     ws.Shapes(nm).Delete
     On Error GoTo 0
 
-    'Create a small shape and auto-fit to text
-    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, rng.Left + 2, rng.Top + 2, 10, 10)
+    'Create a fixed, horizontal button in row 1
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, rng.Left + 2, rng.Top + 2, 215, 20)
     shp.Name = nm
     shp.OnAction = "Run_CopyHere_ParentRows_And_CategoryCheck"
 
     With shp
-        .TextFrame2.TextRange.Text = "Run"
-        .TextFrame2.AutoSize = msoAutoSizeShapeToFitText
-        .TextFrame2.MarginLeft = 6
-        .TextFrame2.MarginRight = 6
-        .TextFrame2.MarginTop = 3
-        .TextFrame2.MarginBottom = 3
+        .TextFrame2.TextRange.Text = " Run Parent Adder and Cat Match "
+        .TextFrame2.Orientation = msoTextOrientationHorizontal
+        .TextFrame2.WordWrap = msoFalse
+        .TextFrame2.AutoSize = msoAutoSizeNone
+        .TextFrame2.MarginLeft = 8
+        .TextFrame2.MarginRight = 8
+        .TextFrame2.MarginTop = 2
+        .TextFrame2.MarginBottom = 2
+        .Left = rng.Left + 2
+        .Top = ws.Rows(1).Top + 1
 
         .Fill.ForeColor.RGB = RGB(0, 51, 102) 'dark blue
         .Line.Visible = msoFalse
@@ -217,12 +221,10 @@ Public Sub Create_CopyHere_RunButton()
         With .TextFrame2.TextRange.Font
             .Fill.ForeColor.RGB = RGB(255, 255, 255) 'white
             .Bold = msoTrue
-            .Size = 10
+            .Size = 9
         End With
 
         .Placement = xlMoveAndSize
     End With
 End Sub
-
-
 
