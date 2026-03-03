@@ -12,6 +12,52 @@ Private Function NormalizeText(ByVal s As String) As String
     NormalizeText = UCase$(s)
 End Function
 
+Private Function SizeSortRank(ByVal sizeVal As String) As Long
+    Select Case NormalizeText(sizeVal)
+        Case "", "PARENT": SizeSortRank = 0
+        Case "S": SizeSortRank = 1
+        Case "M": SizeSortRank = 2
+        Case "L": SizeSortRank = 3
+        Case "XL", "X": SizeSortRank = 4
+        Case "2XL", "XXL", "2X": SizeSortRank = 5
+        Case "3XL", "XXXL", "3X": SizeSortRank = 6
+        Case "4XL", "XXXXL", "4X": SizeSortRank = 7
+        Case Else: SizeSortRank = 99
+    End Select
+End Function
+
+Private Function SizeSuffixCode(ByVal sizeVal As String) As String
+    Select Case NormalizeText(sizeVal)
+        Case "S": SizeSuffixCode = "S"
+        Case "M": SizeSuffixCode = "M"
+        Case "L": SizeSuffixCode = "L"
+        Case "XL", "X": SizeSuffixCode = "X"
+        Case "2XL", "XXL", "2X": SizeSuffixCode = "XX"
+        Case "3XL", "XXXL", "3X": SizeSuffixCode = "XXX"
+        Case "4XL", "XXXXL", "4X": SizeSuffixCode = "XXXX"
+        Case Else: SizeSuffixCode = vbNullString
+    End Select
+End Function
+
+Private Function GetBaseSku(ByVal sku As String, ByVal sizeVal As String) As String
+    Dim suffix As String
+    sku = Trim$(sku)
+    If Len(sku) = 0 Then
+        GetBaseSku = vbNullString
+        Exit Function
+    End If
+
+    suffix = SizeSuffixCode(sizeVal)
+    If Len(suffix) > 0 And Len(sku) > Len(suffix) Then
+        If UCase$(Right$(sku, Len(suffix))) = suffix Then
+            GetBaseSku = Left$(sku, Len(sku) - Len(suffix))
+            Exit Function
+        End If
+    End If
+
+    GetBaseSku = sku
+End Function
+
 Private Function GetSheetLoose(ByVal wb As Workbook, ByVal sheetName As String) As Worksheet
     Dim sh As Object
     Dim target As String: target = NormalizeText(sheetName)
@@ -25,12 +71,17 @@ Private Function GetSheetLoose(ByVal wb As Workbook, ByVal sheetName As String) 
 End Function
 
 Private Function ExtractBeforeSpaceApostrophe(ByVal fullName As String) As String
-    ' Return text before " '" (space + apostrophe). If not found, return whole string.
+    ' Return normalized text before apostrophe marker.
+    ' Primary split: " '" (space + apostrophe); fallback split: first apostrophe.
     Dim p As Long
-    fullName = Trim$(fullName)
+    fullName = NormalizeText(fullName)
+    fullName = Replace(fullName, "’", "'")
+
     p = InStr(1, fullName, " '", vbBinaryCompare)
+    If p = 0 Then p = InStr(1, fullName, "'", vbBinaryCompare)
+
     If p > 0 Then
-        ExtractBeforeSpaceApostrophe = Trim$(Left$(fullName, p - 1))
+        ExtractBeforeSpaceApostrophe = NormalizeText(Left$(fullName, p - 1))
     Else
         ExtractBeforeSpaceApostrophe = fullName
     End If
@@ -43,35 +94,40 @@ Public Sub Run_CopyHere_ParentRows_And_CategoryCheck()
     '---- Column setup (adjust if needed)
     Const COL_SKU_A As Long = 1   'Copy Here: A
     Const COL_SKU_E As Long = 5   'Copy Here: E
+    Const COL_NAME_C As Long = 3  'Copy Here: C
     Const COL_SIZE  As Long = 8   'Copy Here: H
     Const COL_OUT_M As Long = 13  'Copy Here: M
     Const HEADER_ROW As Long = 1
+    Const HELPER_BLOCK_COL As Long = 702  'ZZ
+    Const HELPER_SIZE_COL As Long = 703   'AAA
+    Const HELPER_SEQ_COL As Long = 704    'AAB
 
-    Const CAT_COL_G As Long = 7   'CatMap: G
-    Const CAT_COL_J As Long = 10  'CatMap: J
 
-    Const BRAND_COL_SKU As Long = 1 'Brand: A
-    Const BRAND_COL_NAME As Long = 2 'Brand: B
+    Const CATMAP_COL_PRIMARY_NAME_G As Long = 7   'CatMap: G
+    Const CATMAP_COL_ALT_NAMES_J As Long = 10     'CatMap: J (semicolon-separated aliases)
 
     Dim wb As Workbook
-    Dim wsCopy As Worksheet, wsCat As Worksheet, wsBrand As Worksheet
+    Dim wsCopy As Worksheet, wsCatMap As Worksheet
     Dim lastRow As Long, r As Long
 
-    Dim dictSkuToTerm As Object      'SKU -> extracted term
-    Dim dictCatTerms As Object       'term -> True
+    Dim dictCatMapPrimaryTerms As Object   'primary term from CatMap G -> True
+    Dim dictCatMapAltTerms As Object       'fallback alias from CatMap J -> True
+    Dim dictBlockOrder As Object         'base sku -> first-seen block order
 
     Dim sku As String, baseSku As String, sizeVal As String
     Dim nm As String, term As String
     Dim v As String
+    Dim altNames As String, altTerm As String
+    Dim parts As Variant, part As Variant
+    Dim blockOrder As Long, base As String
 
     Set wb = ActiveWorkbook
 
     Set wsCopy = GetSheetLoose(wb, "Copy Here")
-    Set wsCat = GetSheetLoose(wb, "CatMap")
-    Set wsBrand = GetSheetLoose(wb, "Brand")
+    Set wsCatMap = GetSheetLoose(wb, "CatMap")
 
-    If wsCopy Is Nothing Or wsCat Is Nothing Or wsBrand Is Nothing Then
-        MsgBox "Missing one or more sheets: Copy Here / CatMap / Brand. Check sheet names.", vbExclamation
+    If wsCopy Is Nothing Or wsCatMap Is Nothing Then
+        MsgBox "Missing one or more sheets: Copy Here / CatMap. Check sheet names.", vbExclamation
         Exit Sub
     End If
 
@@ -105,58 +161,97 @@ Public Sub Run_CopyHere_ParentRows_And_CategoryCheck()
     Next r
 
     '========================
-    ' 2) Build lookup: Brand SKU -> extracted term
+    ' 1b) Reorder rows into contiguous parent+size blocks
+    '     - Keep each base SKU together
+    '     - Order inside each block: Parent, S, M, L, XL, 2XL, 3XL, 4XL
     '========================
-    Set dictSkuToTerm = CreateObject("Scripting.Dictionary")
-    dictSkuToTerm.CompareMode = vbTextCompare
+    Set dictBlockOrder = CreateObject("Scripting.Dictionary")
+    dictBlockOrder.CompareMode = vbTextCompare
 
-    lastRow = wsBrand.Cells(wsBrand.Rows.Count, BRAND_COL_SKU).End(xlUp).Row
+    lastRow = wsCopy.Cells(wsCopy.Rows.Count, COL_SKU_A).End(xlUp).Row
+    blockOrder = 0
+
+    For r = HEADER_ROW + 1 To lastRow
+        sku = CStr(wsCopy.Cells(r, COL_SKU_A).Value)
+        sizeVal = CStr(wsCopy.Cells(r, COL_SIZE).Value)
+        base = GetBaseSku(sku, sizeVal)
+
+        If Len(base) = 0 Then
+            wsCopy.Cells(r, HELPER_BLOCK_COL).Value = 999999
+            wsCopy.Cells(r, HELPER_SIZE_COL).Value = 999
+        Else
+            If Not dictBlockOrder.Exists(base) Then
+                blockOrder = blockOrder + 1
+                dictBlockOrder(base) = blockOrder
+            End If
+            wsCopy.Cells(r, HELPER_BLOCK_COL).Value = dictBlockOrder(base)
+            wsCopy.Cells(r, HELPER_SIZE_COL).Value = SizeSortRank(sizeVal)
+        End If
+        wsCopy.Cells(r, HELPER_SEQ_COL).Value = r
+    Next r
+
+    With wsCopy.Sort
+        .SortFields.Clear
+        .SortFields.Add Key:=wsCopy.Range(wsCopy.Cells(HEADER_ROW + 1, HELPER_BLOCK_COL), wsCopy.Cells(lastRow, HELPER_BLOCK_COL)), _
+            SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+        .SortFields.Add Key:=wsCopy.Range(wsCopy.Cells(HEADER_ROW + 1, HELPER_SIZE_COL), wsCopy.Cells(lastRow, HELPER_SIZE_COL)), _
+            SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+        .SortFields.Add Key:=wsCopy.Range(wsCopy.Cells(HEADER_ROW + 1, HELPER_SEQ_COL), wsCopy.Cells(lastRow, HELPER_SEQ_COL)), _
+            SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+
+        .SetRange wsCopy.Range(wsCopy.Cells(HEADER_ROW, COL_SKU_A), wsCopy.Cells(lastRow, HELPER_SEQ_COL))
+        .Header = xlYes
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .Apply
+    End With
+
+    wsCopy.Range(wsCopy.Cells(HEADER_ROW + 1, HELPER_BLOCK_COL), wsCopy.Cells(lastRow, HELPER_SEQ_COL)).ClearContents
+
+    '========================
+    ' 2) Build lookups from CatMap
+    '    - Primary names from column G
+    '    - Fallback aliases from column J (semicolon-separated)
+    '========================
+    Set dictCatMapPrimaryTerms = CreateObject("Scripting.Dictionary")
+    dictCatMapPrimaryTerms.CompareMode = vbTextCompare
+
+    Set dictCatMapAltTerms = CreateObject("Scripting.Dictionary")
+    dictCatMapAltTerms.CompareMode = vbTextCompare
+
+    lastRow = wsCatMap.Cells(wsCatMap.Rows.Count, CATMAP_COL_PRIMARY_NAME_G).End(xlUp).Row
     For r = 2 To lastRow
-        sku = Trim$(CStr(wsBrand.Cells(r, BRAND_COL_SKU).Value))
-        nm = CStr(wsBrand.Cells(r, BRAND_COL_NAME).Value)
-        If Len(sku) > 0 Then
-            term = ExtractBeforeSpaceApostrophe(nm)
-            If Len(term) > 0 Then dictSkuToTerm(sku) = term
+        nm = CStr(wsCatMap.Cells(r, CATMAP_COL_PRIMARY_NAME_G).Value)
+        term = ExtractBeforeSpaceApostrophe(nm)
+        If Len(term) > 0 Then dictCatMapPrimaryTerms(term) = True
+
+        altNames = CStr(wsCatMap.Cells(r, CATMAP_COL_ALT_NAMES_J).Value)
+        If Len(altNames) > 0 Then
+            parts = Split(altNames, ";")
+            For Each part In parts
+                altTerm = ExtractBeforeSpaceApostrophe(CStr(part))
+                If Len(altTerm) > 0 Then dictCatMapAltTerms(altTerm) = True
+            Next part
         End If
     Next r
 
     '========================
-    ' 3) Build lookup: CatMap terms (from G and J)
-    '========================
-    Set dictCatTerms = CreateObject("Scripting.Dictionary")
-    dictCatTerms.CompareMode = vbTextCompare
-
-    Dim lastG As Long, lastJ As Long, lastCat As Long
-    lastG = wsCat.Cells(wsCat.Rows.Count, CAT_COL_G).End(xlUp).Row
-    lastJ = wsCat.Cells(wsCat.Rows.Count, CAT_COL_J).End(xlUp).Row
-    lastCat = IIf(lastG > lastJ, lastG, lastJ)
-
-    For r = 2 To lastCat
-        v = Trim$(CStr(wsCat.Cells(r, CAT_COL_G).Value))
-        If Len(v) > 0 Then dictCatTerms(v) = True
-
-        v = Trim$(CStr(wsCat.Cells(r, CAT_COL_J).Value))
-        If Len(v) > 0 Then dictCatTerms(v) = True
-    Next r
-
-    '========================
-    ' 4) Write results to Copy Here column M
+    ' 3) Write results to Copy Here column M
+    '    Match Copy Here column C against CatMap G first, then fallback to J aliases
     '========================
     lastRow = wsCopy.Cells(wsCopy.Rows.Count, COL_SKU_A).End(xlUp).Row
 
     For r = 2 To lastRow
-        sku = Trim$(CStr(wsCopy.Cells(r, COL_SKU_A).Value))
-        If Len(sku) = 0 Then
+        v = CStr(wsCopy.Cells(r, COL_NAME_C).Value)
+        If Len(v) = 0 Then
             wsCopy.Cells(r, COL_OUT_M).Value = vbNullString
         Else
-            If dictSkuToTerm.Exists(sku) Then
-                term = dictSkuToTerm(sku)
+            term = ExtractBeforeSpaceApostrophe(v)
 
-                If dictCatTerms.Exists(term) Then
-                    wsCopy.Cells(r, COL_OUT_M).Value = "OK"
-                Else
-                    wsCopy.Cells(r, COL_OUT_M).Value = "NO MATCH - CHECK CATEGORIES"
-                End If
+            If dictCatMapPrimaryTerms.Exists(term) Then
+                wsCopy.Cells(r, COL_OUT_M).Value = "OK"
+            ElseIf dictCatMapAltTerms.Exists(term) Then
+                wsCopy.Cells(r, COL_OUT_M).Value = "OK"
             Else
                 wsCopy.Cells(r, COL_OUT_M).Value = "NO MATCH - CHECK CATEGORIES"
             End If
@@ -227,4 +322,3 @@ Public Sub Create_CopyHere_RunButton()
         .Placement = xlMoveAndSize
     End With
 End Sub
-
